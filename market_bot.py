@@ -3,15 +3,17 @@ import schedule
 import time
 import os
 import re
+import xml.etree.ElementTree as ET
 
 TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 GROQ_API_KEY     = os.environ.get("GROQ_API_KEY", "")
 
+# These RSS feeds work without any middleman service
 FEEDS = [
-    ("📈 Nifty/Stock Market", "https://www.livemint.com/rss/markets"),
-    ("🥇 Gold & Commodities",  "https://www.livemint.com/rss/money"),
-    ("📊 Business News",       "https://www.livemint.com/rss/industry"),
+    ("📈 Stock Market", "https://feeds.feedburner.com/ndtvprofit-latest"),
+    ("🥇 Gold & Markets", "https://feeds.feedburner.com/ndtvprofit-latest"),
+    ("📊 Business News", "https://www.business-standard.com/rss/markets-106.rss"),
 ]
 
 sent_headlines = set()
@@ -19,39 +21,60 @@ sent_headlines = set()
 def clean_html(text):
     if not text:
         return ""
-    clean = re.sub(r'<[^>]+>', '', text)
+    clean = re.sub(r'<[^>]+>', ' ', text)
+    clean = re.sub(r'&[a-z]+;', ' ', clean)
     clean = re.sub(r'\s+', ' ', clean).strip()
-    return clean[:500]
+    return clean[:600]
 
-def fetch_headline(feed_url):
+def fetch_headline_direct(feed_url):
     try:
-        api_url = f"https://api.rss2json.com/v1/api.json?rss_url={feed_url}"
-        response = requests.get(api_url, timeout=15)
-        data = response.json()
-        if data.get("status") == "ok":
-            for item in data.get("items", []):
-                title = item.get("title", "").strip()
-                desc  = clean_html(item.get("description", ""))
-                if title and title not in sent_headlines:
-                    sent_headlines.add(title)
-                    if len(sent_headlines) > 100:
-                        sent_headlines.clear()
-                    return title, desc
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/91.0 Safari/537.36",
+            "Accept": "application/rss+xml, application/xml, text/xml, */*"
+        }
+        response = requests.get(feed_url, headers=headers, timeout=15)
+        print(f"RSS HTTP status: {response.status_code}, size: {len(response.content)} bytes")
+
+        root = ET.fromstring(response.content)
+
+        # Try both RSS and Atom formats
+        items = list(root.iter("item")) or list(root.iter("entry"))
+        print(f"Found {len(items)} news items")
+
+        for item in items:
+            # Get title
+            title_el = item.find("title")
+            title = title_el.text.strip() if title_el is not None and title_el.text else ""
+
+            # Get description/summary
+            desc_el = item.find("description") or item.find("summary")
+            desc = clean_html(desc_el.text if desc_el is not None else "")
+
+            if title and title not in sent_headlines:
+                sent_headlines.add(title)
+                if len(sent_headlines) > 100:
+                    sent_headlines.clear()
+                return title, desc
+
     except Exception as e:
         print(f"RSS fetch error: {e}")
     return None, None
 
 def write_tweet_with_groq(headline, description):
     try:
-        context = description if description and len(description) > 20 else headline
+        # Use description if it has meaningful content, else use headline
+        context = description if len(description) > 50 else headline
+        print(f"Sending to Groq: {context[:150]}")
+
         prompt = (
-            f"You are a financial tweet writer for Indian markets.\n"
-            f"News: {context}\n\n"
-            f"Write ONE tweet under 30 words. Include:\n"
-            f"- The key fact or insight from the news\n"
-            f"- 1-2 relevant emojis\n"
-            f"- 2-3 hashtags at the end like #Nifty #Gold #Markets\n"
-            f"Only write the tweet text. Nothing else. No explanations."
+            f"You are a financial tweet writer for Indian stock markets.\n"
+            f"Here is the news: {context}\n\n"
+            f"Write ONE engaging tweet under 30 words. Rules:\n"
+            f"- Include the key fact, number or insight\n"
+            f"- Add 1-2 relevant emojis\n"
+            f"- End with 2-3 hashtags like #Nifty #Gold #Markets #NSE\n"
+            f"- Make it sound like a real trader posted it\n"
+            f"Output ONLY the tweet. No intro, no explanation."
         )
 
         url = "https://api.groq.com/openai/v1/chat/completions"
@@ -62,24 +85,23 @@ def write_tweet_with_groq(headline, description):
         body = {
             "model": "llama3-8b-8192",
             "messages": [
-                {"role": "system", "content": "You are a financial tweet writer. Only output the tweet text, nothing else."},
+                {"role": "system", "content": "You write short financial tweets under 30 words. Output only the tweet text."},
                 {"role": "user", "content": prompt}
             ],
             "max_tokens": 120,
-            "temperature": 0.7
+            "temperature": 0.8
         }
 
         response = requests.post(url, headers=headers, json=body, timeout=15)
-        print(f"Groq HTTP status: {response.status_code}")
+        print(f"Groq HTTP: {response.status_code}")
         data = response.json()
-        print(f"Groq raw response: {str(data)[:300]}")
 
-        if "choices" in data and len(data["choices"]) > 0:
+        if "choices" in data:
             tweet = data["choices"][0]["message"]["content"].strip()
             print(f"✅ Groq tweet: {tweet}")
             return tweet
         else:
-            print(f"❌ Groq unexpected response: {data}")
+            print(f"Groq issue: {data}")
             return None
 
     except Exception as e:
@@ -89,43 +111,39 @@ def write_tweet_with_groq(headline, description):
 def send_to_telegram(text):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     response = requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": text})
-    print(f"Telegram status: {response.status_code}")
+    print(f"Telegram: {response.status_code}")
     if response.status_code == 200:
-        print("✅ Message sent to Telegram!")
+        print("✅ Sent to Telegram!")
     else:
-        print(f"❌ Telegram error: {response.text[:200]}")
+        print(f"❌ Error: {response.text[:200]}")
 
 def job():
     print("--- Fetching market update ---")
     index = int(time.time() / 3600) % len(FEEDS)
     feed_name, feed_url = FEEDS[index]
-    print(f"Feed: {feed_name}")
+    print(f"Feed: {feed_name} -> {feed_url}")
 
-    headline, description = fetch_headline(feed_url)
+    headline, description = fetch_headline_direct(feed_url)
+
     if not headline:
-        print("No new headline found.")
+        print("No headline found this round.")
         return
 
     print(f"Headline: {headline[:100]}")
-    print(f"Description length: {len(description)} chars")
-
     tweet = write_tweet_with_groq(headline, description)
 
     if tweet:
-        final_message = f"{feed_name}\n\n{tweet}"
+        send_to_telegram(f"{feed_name}\n\n{tweet}")
     else:
-        # Fallback if Groq fails
-        final_message = f"{feed_name}\n\n{headline}\n\n#Nifty #Markets #NSE"
+        send_to_telegram(f"{feed_name}\n\n{headline}\n\n#Nifty #Markets #NSE")
 
-    send_to_telegram(final_message)
-
-print(f"Token set:   {'Yes' if TELEGRAM_TOKEN else 'NO - MISSING!'}")
-print(f"Chat ID set: {'Yes' if TELEGRAM_CHAT_ID else 'NO - MISSING!'}")
-print(f"Groq set:    {'Yes' if GROQ_API_KEY else 'NO - MISSING!'}")
+print(f"Token:   {'✅' if TELEGRAM_TOKEN else '❌ MISSING'}")
+print(f"Chat ID: {'✅' if TELEGRAM_CHAT_ID else '❌ MISSING'}")
+print(f"Groq:    {'✅' if GROQ_API_KEY else '❌ MISSING'}")
 
 job()
 schedule.every(1).hours.do(job)
-print("Bot running! AI-powered tweet updates every hour...")
+print("Bot running! AI tweet updates every hour...")
 while True:
     schedule.run_pending()
     time.sleep(60)
