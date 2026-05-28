@@ -2,6 +2,7 @@ import requests
 import schedule
 import time
 import os
+import re
 
 TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
@@ -15,6 +16,13 @@ FEEDS = [
 
 sent_headlines = set()
 
+def clean_html(text):
+    if not text:
+        return ""
+    clean = re.sub(r'<[^>]+>', '', text)
+    clean = re.sub(r'\s+', ' ', clean).strip()
+    return clean[:500]
+
 def fetch_headline(feed_url):
     try:
         api_url = f"https://api.rss2json.com/v1/api.json?rss_url={feed_url}"
@@ -23,7 +31,7 @@ def fetch_headline(feed_url):
         if data.get("status") == "ok":
             for item in data.get("items", []):
                 title = item.get("title", "").strip()
-                desc  = item.get("description", "").strip()
+                desc  = clean_html(item.get("description", ""))
                 if title and title not in sent_headlines:
                     sent_headlines.add(title)
                     if len(sent_headlines) > 100:
@@ -35,15 +43,15 @@ def fetch_headline(feed_url):
 
 def write_tweet_with_groq(headline, description):
     try:
+        context = description if description and len(description) > 20 else headline
         prompt = (
             f"You are a financial tweet writer for Indian markets.\n"
-            f"News headline: {headline}\n"
-            f"Extra context: {description[:300] if description else 'none'}\n\n"
+            f"News: {context}\n\n"
             f"Write ONE tweet under 30 words. Include:\n"
-            f"- Key fact or number from the news\n"
+            f"- The key fact or insight from the news\n"
             f"- 1-2 relevant emojis\n"
             f"- 2-3 hashtags at the end like #Nifty #Gold #Markets\n"
-            f"Only write the tweet. Nothing else."
+            f"Only write the tweet text. Nothing else. No explanations."
         )
 
         url = "https://api.groq.com/openai/v1/chat/completions"
@@ -53,19 +61,29 @@ def write_tweet_with_groq(headline, description):
         }
         body = {
             "model": "llama3-8b-8192",
-            "messages": [{"role": "user", "content": prompt}],
-            "max_tokens": 100,
+            "messages": [
+                {"role": "system", "content": "You are a financial tweet writer. Only output the tweet text, nothing else."},
+                {"role": "user", "content": prompt}
+            ],
+            "max_tokens": 120,
             "temperature": 0.7
         }
 
         response = requests.post(url, headers=headers, json=body, timeout=15)
+        print(f"Groq HTTP status: {response.status_code}")
         data = response.json()
-        tweet = data["choices"][0]["message"]["content"].strip()
-        print(f"Groq wrote: {tweet}")
-        return tweet
+        print(f"Groq raw response: {str(data)[:300]}")
+
+        if "choices" in data and len(data["choices"]) > 0:
+            tweet = data["choices"][0]["message"]["content"].strip()
+            print(f"✅ Groq tweet: {tweet}")
+            return tweet
+        else:
+            print(f"❌ Groq unexpected response: {data}")
+            return None
 
     except Exception as e:
-        print(f"Groq error: {e}")
+        print(f"Groq exception: {e}")
         return None
 
 def send_to_telegram(text):
@@ -75,7 +93,7 @@ def send_to_telegram(text):
     if response.status_code == 200:
         print("✅ Message sent to Telegram!")
     else:
-        print(f"❌ Error: {response.text[:200]}")
+        print(f"❌ Telegram error: {response.text[:200]}")
 
 def job():
     print("--- Fetching market update ---")
@@ -88,15 +106,18 @@ def job():
         print("No new headline found.")
         return
 
-    print(f"Headline: {headline[:80]}")
+    print(f"Headline: {headline[:100]}")
+    print(f"Description length: {len(description)} chars")
+
     tweet = write_tweet_with_groq(headline, description)
 
     if tweet:
         final_message = f"{feed_name}\n\n{tweet}"
-        send_to_telegram(final_message)
     else:
-        # Fallback — send headline directly if Groq fails
-        send_to_telegram(f"{feed_name}\n\n{headline}\n\n#Nifty #Markets #NSE")
+        # Fallback if Groq fails
+        final_message = f"{feed_name}\n\n{headline}\n\n#Nifty #Markets #NSE"
+
+    send_to_telegram(final_message)
 
 print(f"Token set:   {'Yes' if TELEGRAM_TOKEN else 'NO - MISSING!'}")
 print(f"Chat ID set: {'Yes' if TELEGRAM_CHAT_ID else 'NO - MISSING!'}")
