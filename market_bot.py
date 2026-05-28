@@ -1,77 +1,62 @@
 import requests
 import schedule
 import time
-import json
+import xml.etree.ElementTree as ET
 
-GEMINI_API_KEY   = "AIzaSyBLAWxn_3pCAemojs3B-FW5_Vfbz55Y_eg"
 TELEGRAM_TOKEN   = "8631241825:AAH27LMk13fvf5P7iL-FvUT6Txot0-T3pYw"
 TELEGRAM_CHAT_ID = "8396729316"
 
-MARKETS = ["Nifty 50", "Bank Nifty", "XAUUSD Gold", "Sensex"]
+# Free RSS news feeds for Indian markets & Gold
+RSS_FEEDS = [
+    ("Nifty/Sensex", "https://economictimes.indiatimes.com/markets/stocks/rss.cms"),
+    ("XAUUSD/Gold",  "https://economictimes.indiatimes.com/markets/commodities/rss.cms"),
+    ("Stock News",   "https://www.moneycontrol.com/rss/marketreports.xml"),
+]
 
-def get_market_update():
-    market = MARKETS[int(time.time() / 3600) % len(MARKETS)]
+sent_headlines = set()
 
-    prompt = (
-        f"Write a market update tweet for {market} right now. "
-        f"Include price or % change, key reason, and emoji. "
-        f"Keep it UNDER 30 WORDS. End with 2-3 hashtags. "
-        f"Only write the tweet text, nothing else."
-    )
-
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}"
-
-    body = {
-        "contents": [
-            {
-                "parts": [{"text": prompt}]
-            }
-        ],
-        "generationConfig": {
-            "maxOutputTokens": 100,
-            "temperature": 0.7
-        }
-    }
-
+def fetch_latest_headline(feed_name, feed_url):
     try:
-        response = requests.post(url, json=body, timeout=30)
-        data = response.json()
+        headers = {"User-Agent": "Mozilla/5.0"}
+        response = requests.get(feed_url, headers=headers, timeout=15)
+        root = ET.fromstring(response.content)
 
-        print("Gemini response:", json.dumps(data, indent=2)[:500])
-
-        if "candidates" in data and len(data["candidates"]) > 0:
-            text = data["candidates"][0]["content"]["parts"][0]["text"]
-            return text.strip()
-        elif "error" in data:
-            print("Gemini error:", data["error"]["message"])
-            return None
-        else:
-            print("Unexpected response:", data)
-            return None
-
+        for item in root.iter("item"):
+            title = item.find("title")
+            if title is not None and title.text:
+                headline = title.text.strip()
+                if headline not in sent_headlines:
+                    sent_headlines.add(headline)
+                    # Keep set small
+                    if len(sent_headlines) > 100:
+                        sent_headlines.pop()
+                    return f"📊 {feed_name} Update:\n{headline}"
     except Exception as e:
-        print("Exception:", str(e))
-        return None
+        print(f"Error fetching {feed_name}: {e}")
+    return None
 
 def send_to_telegram(text):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     response = requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": text})
-    print(f"Telegram response: {response.status_code}")
+    print(f"Telegram status: {response.status_code}")
     print(f"Sent: {text[:80]}...")
 
 def job():
-    print("Fetching market update...")
-    tweet = get_market_update()
-    if tweet:
-        send_to_telegram(tweet)
+    print("Fetching market news...")
+    # Rotate through feeds each hour
+    index = int(time.time() / 3600) % len(RSS_FEEDS)
+    feed_name, feed_url = RSS_FEEDS[index]
+    headline = fetch_latest_headline(feed_name, feed_url)
+    if headline:
+        send_to_telegram(headline)
     else:
-        print("No update to send this round.")
+        print("No new headline found this round.")
 
 # Run once immediately, then every hour
 job()
 schedule.every(1).hours.do(job)
 
-print("Bot is running! Sending market updates every hour...")
+print("Bot running! Fetching market news every hour...")
 while True:
     schedule.run_pending()
     time.sleep(60)
